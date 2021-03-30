@@ -894,8 +894,8 @@ class DSLParserV2(BaseDSLParser):
             raise ModeError()
 
         self.dsl = copy.deepcopy(dsl)
-        self._init_components(mode, version=2)
-        self._find_dependencies(mode, version=2)
+        self._init_components(mode, version=2)# 根据dsl初始化组件
+        self._find_dependencies(mode, version=2) # 设置upstream、downstream
         self.runtime_conf = runtime_conf
         self.pipeline_runtime_conf = pipeline_runtime_conf
         self.mode = mode
@@ -911,7 +911,8 @@ class DSLParserV2(BaseDSLParser):
 
         self.args_input = parameter_util.ParameterUtilV2.get_input_parameters(runtime_conf,
                                                                               components=self._get_reader_components())
-
+        if mode == "train":
+            self._auto_deduction(setting_conf_prefix, version=2)
         self.prepare_graph_dependency_info()
 
         return self.components
@@ -924,11 +925,25 @@ class DSLParserV2(BaseDSLParser):
 
         return reader_components
 
-    def get_need_deploy_parameter(self, name, deploy_cpns=None, **kwargs):
+    def get_need_deploy_parameter(self, name, setting_conf_prefix=None, deploy_cpns=None):
         if deploy_cpns is not None:
             return name in deploy_cpns
 
-        return False
+        if "need_deploy" in self.dsl["components"][name]:
+            return self.dsl["components"][name].get("need_deploy")
+
+        module = self.dsl["components"][name].get("module")
+
+        setting_conf_path = os.path.join(setting_conf_prefix, module + ".json")
+        if not os.path.isfile(setting_conf_path):
+            raise ModuleNotExistError(component=name, module=module)
+
+        need_deploy = True
+        with open(os.path.join(setting_conf_prefix, module + ".json"), "r") as fin:
+            setting_dict = json.loads(fin.read())
+            need_deploy = setting_dict.get("need_deploy", True)
+
+        return need_deploy
 
     @staticmethod
     def _gen_predict_data_mapping():
