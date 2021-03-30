@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import json
 import os
 import shutil
 import traceback
@@ -29,7 +30,7 @@ from fate_flow.pipelined_model.migrate_model import compare_roles
 from fate_flow.scheduler import DAGScheduler
 from fate_flow.settings import stat_logger, MODEL_STORE_ADDRESS, TEMP_DIRECTORY
 from fate_flow.pipelined_model import migrate_model, pipelined_model, publish_model
-from fate_flow.utils.api_utils import get_json_result, federated_api, error_response
+from fate_flow.utils.api_utils import get_json_result, federated_api, error_response, local_api
 from fate_flow.utils import job_utils
 from fate_flow.utils.service_utils import ServiceUtils
 from fate_flow.utils.detect_utils import check_config
@@ -50,10 +51,12 @@ def internal_server_error(e):
 @manager.route('/load', methods=['POST'])
 def load_model():
     request_config = request.json
-    if request_config.get('job_id', None):
+    job_id = request_config.get('job_id') if 'job_id' in request_config else request_config.get('job_parameters',{}).get("model_version",None)
+    dsl = ""
+    if job_id:
         with DB.connection_context():
             model = MLModel.get_or_none(
-                MLModel.f_job_id == request_config.get("job_id"),
+                MLModel.f_job_id == job_id,
                 MLModel.f_role == 'guest'
             )
         if model:
@@ -61,16 +64,26 @@ def load_model():
             request_config['initiator'] = {}
             request_config['initiator']['party_id'] = str(model_info.get('f_initiator_party_id'))
             request_config['initiator']['role'] = model_info.get('f_initiator_role')
-            request_config['job_parameters'] = model_info.get('f_runtime_conf').get('job_parameters')
+            if model_info.get('f_runtime_conf').get('dsl_version') == 2:
+                request_config['job_parameters'] = model_info.get('f_runtime_conf').get('job_parameters').get("common")
+            else:
+                request_config['job_parameters'] = model_info.get('f_runtime_conf').get('job_parameters')
             request_config['role'] = model_info.get('f_runtime_conf').get('role')
+
+            dsl = model_info.get('f_dsl')
+
             for key, value in request_config['role'].items():
                 for i, v in enumerate(value):
                     value[i] = str(v)
-            request_config.pop('job_id')
+            request_config.pop('job_id', None)
         else:
             return get_json_result(retcode=101,
                                    retmsg="model with version {} can not be found in database. "
-                                          "Please check if the model version is valid.".format(request_config.get('job_id')))
+                                          "Please check if the model version is valid.".format(job_id))
+    else:
+        return get_json_result(retcode=101,
+                               retmsg="job_id or model_version must be defined")
+
     _job_id = job_utils.generate_job_id()
     initiator_party_id = request_config['initiator']['party_id']
     initiator_role = request_config['initiator']['role']
@@ -79,40 +92,65 @@ def load_model():
     load_status_info = {}
     load_status_msg = 'success'
     load_status_info['detail'] = {}
-    if "federated_mode" not in request_config['job_parameters']:
-        if request_config["job_parameters"]["work_mode"] == WorkMode.STANDALONE:
-            request_config['job_parameters']["federated_mode"] = FederatedMode.SINGLE
-        elif request_config["job_parameters"]["work_mode"] == WorkMode.CLUSTER:
-            request_config['job_parameters']["federated_mode"] = FederatedMode.MULTIPLE
-    for role_name, role_partys in request_config.get("role").items():
-        if role_name == 'arbiter':
-            continue
+
+    # 判断是横向还是纵向
+    if "Homo" in json.dumps(dsl):
+        role_name = "guest"
+        _party_id = request_config.get("role").get(role_name)[0]
+        request_config['local'] = {'role': role_name, 'party_id': _party_id}
         load_status_info[role_name] = load_status_info.get(role_name, {})
         load_status_info['detail'][role_name] = {}
-        for _party_id in role_partys:
-            request_config['local'] = {'role': role_name, 'party_id': _party_id}
-            try:
-                response = federated_api(job_id=_job_id,
-                                         method='POST',
-                                         endpoint='/model/load/do',
-                                         src_party_id=initiator_party_id,
-                                         dest_party_id=_party_id,
-                                         src_role = initiator_role,
-                                         json_body=request_config,
-                                         federated_mode=request_config['job_parameters']['federated_mode'])
-                load_status_info[role_name][_party_id] = response['retcode']
-                detail = {_party_id: {}}
-                detail[_party_id]['retcode'] = response['retcode']
-                detail[_party_id]['retmsg'] = response['retmsg']
-                load_status_info['detail'][role_name].update(detail)
-                if response['retcode']:
-                    load_status = False
-                    load_status_msg = 'failed'
-            except Exception as e:
-                stat_logger.exception(e)
+        try:
+            response = local_api(job_id=_job_id,method='POST',endpoint='/model/load/do', json_body=request_config)
+            load_status_info[role_name][_party_id] = response['retcode']
+            detail = {_party_id: {}}
+            detail[_party_id]['retcode'] = response['retcode']
+            detail[_party_id]['retmsg'] = response['retmsg']
+            load_status_info['detail'][role_name].update(detail)
+            if response['retcode']:
                 load_status = False
                 load_status_msg = 'failed'
-                load_status_info[role_name][_party_id] = 100
+        except Exception as e:
+            stat_logger.exception(e)
+            load_status = False
+            load_status_msg = 'failed'
+            load_status_info[role_name][_party_id] = 100
+
+    else:
+        if "federated_mode" not in request_config['job_parameters']:
+            if request_config["job_parameters"]["work_mode"] == WorkMode.STANDALONE:
+                request_config['job_parameters']["federated_mode"] = FederatedMode.SINGLE
+            elif request_config["job_parameters"]["work_mode"] == WorkMode.CLUSTER:
+                request_config['job_parameters']["federated_mode"] = FederatedMode.MULTIPLE
+        for role_name, role_partys in request_config.get("role").items():
+            if role_name == 'arbiter':
+                continue
+            load_status_info[role_name] = load_status_info.get(role_name, {})
+            load_status_info['detail'][role_name] = {}
+            for _party_id in role_partys:
+                request_config['local'] = {'role': role_name, 'party_id': _party_id}
+                try:
+                    response = federated_api(job_id=_job_id,
+                                             method='POST',
+                                             endpoint='/model/load/do',
+                                             src_party_id=initiator_party_id,
+                                             dest_party_id=_party_id,
+                                             src_role = initiator_role,
+                                             json_body=request_config,
+                                             federated_mode=request_config['job_parameters']['federated_mode'])
+                    load_status_info[role_name][_party_id] = response['retcode']
+                    detail = {_party_id: {}}
+                    detail[_party_id]['retcode'] = response['retcode']
+                    detail[_party_id]['retmsg'] = response['retmsg']
+                    load_status_info['detail'][role_name].update(detail)
+                    if response['retcode']:
+                        load_status = False
+                        load_status_msg = 'failed'
+                except Exception as e:
+                    stat_logger.exception(e)
+                    load_status = False
+                    load_status_msg = 'failed'
+                    load_status_info[role_name][_party_id] = 100
     return get_json_result(job_id=_job_id, retcode=(0 if load_status else 101), retmsg=load_status_msg,
                            data=load_status_info)
 
@@ -200,6 +238,7 @@ def do_migrate_model():
 def do_load_model():
     request_data = request.json
     adapter_servings_config(request_data)
+    # 加载模型到serving
     retcode, retmsg = publish_model.load_model(config_data=request_data)
     try:
         if not retcode:
@@ -223,6 +262,7 @@ def do_load_model():
                                       request_data.get("job_parameters").get("model_version"))
         dst_model_path = os.path.join(file_utils.get_project_base_directory(), 'loaded_model_backup',
                                       party_model_id, request_data.get("job_parameters").get("model_version"))
+        # 将模型从model_local_cache复制到loaded_model_backup
         if not os.path.exists(dst_model_path):
             shutil.copytree(src=src_model_path, dst=dst_model_path)
     except Exception as copy_err:
